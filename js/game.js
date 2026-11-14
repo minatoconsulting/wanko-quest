@@ -905,7 +905,7 @@ function passSetup() {
   if (!S) return;
   S.passAsk = true; save();
   modal(`<div class="plain"><h3>合言葉を決めよう</h3>
-    ${sayHTML('mage', '名前と合言葉を決めておくと、<b>ほかのスマホやアプリ</b>で開いても続きから遊べるよ！')}
+    ${sayHTML('mage', '名前と合言葉を決めておくと、ほかのスマホやアプリで開いても続きから遊べるよ！')}
     <input type="text" id="snm" maxlength="10" placeholder="名前" value="${esc(S.name)}">
     <input type="tel" id="spin" inputmode="numeric" maxlength="4" placeholder="合言葉（数字4けた）" autocomplete="off" style="margin-top:8px">
     <p class="muted" style="margin:8px 0 0">忘れないようにメモしておいてね</p>
@@ -954,10 +954,12 @@ async function codeImportGo(code, auto) {
 }
 // アーティファクト（前の場所）から、記録ごと新しい場所へ引っ越す
 async function moveOut() {
+  // はじめる画面から押したときは、はじめる画面を閉じる（開いたままだと、この案内がうしろに隠れる）
+  const st = $('#start'); if (st) { STARTING = false; st.remove(); render(); }
   let url = NEW_URL, code = '';
   if (S) { try { code = await packSave(S); url = NEW_URL + '#import=' + code; } catch (e) {} }
   modal(`<div class="plain"><h3>新しい場所へ引っ越し</h3>
-    ${sayHTML('mage', '新しい場所では、<b>名前と合言葉</b>で、どのスマホやアプリからでも続きから遊べるよ！')}
+    ${sayHTML('mage', '新しい場所では「名前と合言葉」で、どのスマホやアプリからでも続きから遊べるよ！')}
     <a class="btn grn w" href="${url}" target="_blank" rel="noopener" style="text-decoration:none">${S ? '記録ごと新しい場所を開く' : '新しい場所を開く'}</a>
     ${code ? `<p class="muted" style="margin:12px 0 4px">うまく開けないときは、下のコードをコピーして、新しい場所の「引き継ぎコードで続きから」に貼りつけてね</p>
     <textarea id="mcode" readonly style="min-height:70px;font-size:12px">${code}</textarea>
