@@ -124,9 +124,11 @@ function save() { if (S) S.savedAt = Date.now(); try { localStorage.setItem(KEY,
 
 // ================= 記録をスマホの外にも残す =================
 // 1) Claude のアカウント（2026-11-13）：アーティファクトの中で、Claude にサインインして開いた人（db の data/users/<id>/）
-// 2) 名前＋合言葉（2026-11-14 本人の指示）：GitHub Pages に移したあとの本番。Supabase（sugoroku プロジェクト）の wq_saves に
-//    名前＋4けたの合言葉で残し、LINE・Safari・パソコンのどれで開いても続きから遊べるようにした
-//    （アーティファクトの中からは外のサーバーにつなげないので、合言葉はアーティファクトでは使わない）
+// 2) メールアドレス＋パスワード（2026-11-15 本人の指示。前の日は名前＋4けたの合言葉だった）：GitHub Pages の本番。
+//    Supabase（sugoroku プロジェクト）の wq_accounts に残し、LINE・Safari・パソコンのどれで開いても続きから遊べるようにした。
+//    サーバーの作りは supabase/wq2-email-login.sql。スマホにはパスワードを残さず、ログイン中の札（token）だけを残す。
+//    パスワードを忘れたら、メールのリンク（#reset=…）から新しいパスワードを決める（メールはすごろくの管理シートから送る）
+//    （アーティファクトの中からは外のサーバーにつなげないので、アーティファクトでは使わない）
 // どちらも、開いたときに読みこんで、進んでいるほうを使う。手元のほうが進んでいれば送る
 // save() は上のほうでも呼ばれるので var にしておく（let だと宣言より前で呼ばれたときにエラーになる）
 var CLOUD = null, CLOUD_BEST = -1, CLOUD_T = null, CLOUD_BUSY = false, CLOUD_AGAIN = false;
@@ -137,43 +139,70 @@ function prog(s) {
   for (const k in (s.ch || {})) { const c = s.ch[k] || {}; n += (c.win ? 3 : 0) + (c.lesson ? 1 : 0) + (c.clear ? 5 : 0); }
   return n;
 }
-// ---- 名前＋合言葉 ----
+// ---- メールアドレス＋パスワード ----
 const NEW_URL = 'https://minatoconsulting.github.io/wanko-quest/';
 const SB_RPC = 'https://axaxqgvvezvhffopggba.supabase.co/rest/v1/rpc/';
 const SB_KEY = 'sb_publishable_Fqiwpwq3y7VBDyzBXNheRA_KVo1lHBQ';
-const PASS_KEY = 'wanko-quest-pass';
-// 合言葉の保存が使える場所（GitHub Pages と手元の確認用。アーティファクトの中は外につなげないので false）
+const ACC_KEY = 'wanko-quest-acc';
+// メールアドレスで記録を残せる場所（GitHub Pages と手元の確認用。アーティファクトの中は外につなげないので false）
 const PASS_HOST = /(^|\.)github\.io$|^localhost$|^127\.0\.0\.1$/.test(location.hostname);
+// 前の日の「名前＋合言葉」の覚え書きは使わなくなったので消す（サーバーに記録を作った人はいなかった）
+try { localStorage.removeItem('wanko-quest-pass'); } catch (e) {}
 async function sbCall(fn, body) {
   const r = await fetch(SB_RPC + fn, { method: 'POST', headers: { apikey: SB_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   if (!r.ok) throw new Error('http ' + r.status);
   return r.json();
 }
-function passGet() { try { const p = JSON.parse(localStorage.getItem(PASS_KEY)); return p && p.name && /^\d{4}$/.test(p.pin) ? p : null; } catch (e) { return null; } }
-function passSet(p) { try { if (p) localStorage.setItem(PASS_KEY, JSON.stringify(p)); else localStorage.removeItem(PASS_KEY); } catch (e) {} }
+// このスマホで入っているアカウント（メールアドレス・名前・ログイン中の札）
+function accGet() { try { const a = JSON.parse(localStorage.getItem(ACC_KEY)); return a && a.email && a.token ? a : null; } catch (e) { return null; } }
+function accSet(a) { try { if (a) localStorage.setItem(ACC_KEY, JSON.stringify(a)); else localStorage.removeItem(ACC_KEY); } catch (e) {} }
+// ログインが切れていた（ほかのスマホでパスワードを作り直したときなど）。
+// 古い札の返事があとから届いても、入り直したあとの新しい札は消さない
+function accLost(a) {
+  const cur = accGet(); if (cur && cur.token !== a.token) return;
+  accSet(null); if (CLOUD && CLOUD.kind === 'acc' && CLOUD.token === a.token) CLOUD = null;
+  toast('ログインが切れました。宿屋の「記録の残しかた」から入り直してね');
+}
 // 送る記録：経験値の記録（log）は画面に出すのが30件なので200件まで。ガイドから戻る位置（back）は送らない
 function cloudData(s) { return JSON.stringify(Object.assign({}, s, { log: (s.log || []).slice(0, 200), back: null })); }
-function passCloud(p) {
-  const who = { p_name: p.name, p_pin: p.pin };
+function accCloud(a) {
   return {
-    kind: 'pass', name: p.name,
+    kind: 'acc', email: a.email, token: a.token,
     async get() {
-      const r = await sbCall('wq_load', who);
+      const r = await sbCall('wq2_load', { p_token: a.token });
       if (r.ok) return r.data;
-      if (r.err === 'none') return null;
-      if (r.err === 'pin') { passSet(null); CLOUD = null; toast('合言葉が合わなくなりました。宿屋の「記録の残しかた」から入れ直してね'); }
+      if (r.err === 'session') accLost(a);
       throw new Error(r.err);
     },
     async put(str, t, pg) {
-      let r = await sbCall('wq_save', Object.assign({ p_data: str, p_prog: pg, p_saved_at: t }, who));
-      // サーバーの記録が消えていたら（はじめからやり直した直後など）作り直す
-      if (!r.ok && r.err === 'none') r = await sbCall('wq_save', Object.assign({ p_data: str, p_prog: pg, p_saved_at: t, p_create: true }, who));
+      const r = await sbCall('wq2_save', { p_token: a.token, p_data: str, p_prog: pg, p_saved_at: t });
       if (!r.ok && r.err === 'older') { CLOUD_BEST = Math.max(CLOUD_BEST, r.prog || 0); return; }
+      if (!r.ok && r.err === 'session') accLost(a);
       if (!r.ok) throw new Error(r.err);
     },
-    async del() { await sbCall('wq_forget', who); },
+    async del() { await sbCall('wq2_delete', { p_token: a.token }); },
   };
 }
+// ログイン・登録・パスワードの作り直しが終わったとき：このスマホで入ったことにする
+function accUse(email, token, name) { const a = { email, token, name }; accSet(a); CLOUD = accCloud(a); return a; }
+// サーバーから返ってきた記録を、このスマホの記録にする
+function accTake(r) {
+  let c = null;
+  try { const x = JSON.parse(r.data); if (x && x.v === 1) c = fill(x); } catch (e) {}
+  if (!c) return false;
+  if (START_SND !== null) { c.sound = START_SND; c.music = START_SND; }
+  c.back = null; c.accAsk = true;
+  S = c;
+  try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
+  CLOUD_BEST = prog(c);
+  return true;
+}
+const accErr = {
+  email: 'メールアドレスを確かめてね', pwlen: 'パスワードは6文字以上にしてね', none: 'このメールアドレスでは登録がありません',
+  pw: 'パスワードがちがいます', locked: 'まちがいが多いので、30分ほど待ってね', many: '何回も送ったので、1時間ほど待ってね',
+  taken: 'このメールアドレスはもう登録されています。「メールアドレスで続きから」から入ってね',
+};
+function accMsg(r, def) { return !r ? 'つながりませんでした。電波のよいところでもう一度' : (accErr[r.err] || def); }
 // ---- Claude のアカウント（アーティファクトの db） ----
 function dbCloud(db, uid) {
   const doc = () => db.collection('data/users/' + uid).doc(KEY);
@@ -187,8 +216,8 @@ function dbCloud(db, uid) {
 async function cloudInit() {
   try {
     if (PASS_HOST) {
-      const p = passGet();
-      if (p && !TAIKAI) { CLOUD = passCloud(p); await cloudPull(); }
+      const a = accGet();
+      if (a && !TAIKAI) { CLOUD = accCloud(a); await cloudPull(); }
       return;
     }
     if (!window.claude || !window.claude.use) return;
@@ -198,12 +227,12 @@ async function cloudInit() {
     if (!uid) return;
     CLOUD = dbCloud(db, uid);
     await cloudPull();
-  } catch (e) { if (!(CLOUD && CLOUD.kind === 'pass')) CLOUD = null; }
+  } catch (e) { if (!(CLOUD && CLOUD.kind === 'acc')) CLOUD = null; }
 }
 // 外の記録を読み、そちらが進んでいれば入れかえる。手元のほうが進んでいれば送る
 async function cloudPull() {
   if (!CLOUD) return;
-  if (CLOUD.kind === 'pass' && TAIKAI) return; // 大会の記録は合言葉には残さない
+  if (CLOUD.kind === 'acc' && TAIKAI) return; // 大会の記録はメールアドレスの記録には残さない
   const key = KEY, cl = CLOUD;
   let str;
   try { str = await cl.get(); } catch (e) { return; }
@@ -220,14 +249,14 @@ async function cloudPull() {
     try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
     if (!$('#start')) { closeModal(); TAB = 'home'; }
     render();
-    toast(cl.kind === 'pass' ? '合言葉の記録から続きを読みこみました' : 'Claudeのアカウントから続きを読みこみました');
+    toast(cl.kind === 'acc' ? 'メールアドレスの記録から続きを読みこみました' : 'Claudeのアカウントから続きを読みこみました');
   } else if (S && !(c && pc === ps && (c.savedAt || 0) === (S.savedAt || 0))) cloudPush();
 }
 function cloudSoon() { if (!CLOUD) return; clearTimeout(CLOUD_T); CLOUD_T = setTimeout(cloudPush, 2000); }
 async function cloudPush() {
   clearTimeout(CLOUD_T); CLOUD_T = null;
   if (!CLOUD || !S) return;
-  if (CLOUD.kind === 'pass' && TAIKAI) return;
+  if (CLOUD.kind === 'acc' && TAIKAI) return;
   if (prog(S) < CLOUD_BEST) return; // ほかのスマホやパソコンのほうが進んでいる（古い画面からは上書きしない）
   if (CLOUD_BUSY) { CLOUD_AGAIN = true; return; }
   CLOUD_BUSY = true;
@@ -238,11 +267,11 @@ async function cloudPush() {
   CLOUD_BUSY = false;
   if (CLOUD_AGAIN) { CLOUD_AGAIN = false; cloudPush(); }
 }
-// 「はじめからやり直す」で消したときは、外の記録も消す（合言葉も忘れる）
+// 「はじめからやり直す」で消したときは、外の記録も消す（メールアドレスのアカウントも消える。同じアドレスでまた登録できる）
 function cloudForget() {
   clearTimeout(CLOUD_T); CLOUD_T = null; CLOUD_BEST = -1;
   if (CLOUD) CLOUD.del().catch(() => {});
-  if (CLOUD && CLOUD.kind === 'pass') { passSet(null); CLOUD = null; }
+  if (CLOUD && CLOUD.kind === 'acc') { accSet(null); CLOUD = null; }
 }
 // 画面にもどってきたら、ほかのスマホやパソコンで進めた分を読みこむ。画面を離れるときは、まだ送っていない分をすぐ送る
 document.addEventListener('visibilitychange', () => {
@@ -759,6 +788,8 @@ function nextModal() {
   el._onClose = m.onClose;
 }
 function closeModal() { const f = $('#modal')._onClose; nextModal(); if (f) f(); }
+// いま出ている小窓を、つぎの小窓に入れかえる（modal は順番待ちなので、そのまま呼ぶと今の小窓のうしろに並んで見えない）
+function modalSwap(html) { if (!mOpen) { modal(html); return; } $('#modal')._onClose = null; MQ.unshift({ html }); nextModal(); }
 function toast(msg) {
   const t = document.createElement('div');
   t.className = 'toast'; t.textContent = msg;
@@ -826,8 +857,8 @@ function viewCreate() {
     <div class="pad">
       ${TAIKAI ? `<div class="card"><h3>大会モード</h3><p style="margin:0;font-size:14px">大会用のまっさらな記録で始まります。ふだんの記録は消えずに残っています</p></div>` : ''}
       ${PASS_HOST && !TAIKAI ? `<div class="card plain passin"><h3>前に遊んだことがある人</h3>
-        <p class="muted" style="margin:0 0 8px">名前と合言葉を入れると、続きから遊べます</p>
-        <button class="btn grn w" onclick="passLogin()">名前と合言葉で続きから</button>
+        <p class="muted" style="margin:0 0 8px">登録したメールアドレスとパスワードで、続きから遊べます</p>
+        <button class="btn grn w" onclick="accLogin()">メールアドレスで続きから</button>
         <button class="btn sub sm w" style="margin-top:8px" onclick="codeImport()">引き継ぎコードで続きから</button></div>` : ''}
       <div class="card"><h3>相棒の犬種をえらぶ</h3>
         <div class="breeds">${BREEDS.map(b => `<button class="${pickBreed === b.id ? 'on' : ''}" onclick="pickBreed='${b.id}';render()"><img src="img/hero_${b.id}_1.webp" alt=""><br>${b.name}</button>`).join('')}</div>
@@ -836,9 +867,9 @@ function viewCreate() {
         <input type="text" id="nm" maxlength="10" placeholder="例 コツ太">
         <p class="muted">あなた自身の名前でもOK</p>
       </div>
-      ${PASS_HOST && !TAIKAI ? `<div class="card plain"><h3>合言葉を決める（数字4けた）</h3>
-        <input type="tel" id="pin" inputmode="numeric" maxlength="4" placeholder="例 0814" autocomplete="off">
-        <p class="muted">名前と合言葉で、ほかのスマホやアプリからも続きから遊べます。忘れないようにメモしておいてね</p>
+      ${PASS_HOST && !TAIKAI ? `<div class="card plain"><h3>メールアドレスとパスワードを決める</h3>
+        ${accFields('n', '', 'off')}
+        <p class="muted">ほかのスマホやアプリで開いたときに、続きから遊ぶのに使います。パスワードは6文字以上で、忘れないようにメモしておいてね</p>
       </div>` : ''}
       <button class="btn w" id="startbtn" onclick="startGame()">冒険をはじめる</button>
     </div>`;
@@ -848,19 +879,19 @@ async function startGame() {
   if (!name) { toast('名前を入れてね'); return; }
   const s = newState(name, pickBreed);
   if (START_SND === false) { s.sound = false; s.music = false; }
-  // 合言葉を決めて、サーバーに記録を作る（同じ名前がほかの合言葉で使われていたら、名前を変えてもらう）
+  // メールアドレスとパスワードを登録して、サーバーに記録を作る（同じメールアドレスが登録ずみなら「続きから」へ）
   if (PASS_HOST && !TAIKAI) {
-    const pin = toHalf($('#pin').value).trim();
-    if (!/^\d{4}$/.test(pin)) { toast('合言葉は数字4けたで入れてね'); return; }
+    const email = emNorm($('#nem').value), pw = pwNorm($('#npw').value);
+    if (!emOk(email)) { toast('メールアドレスを入れてね'); return; }
+    if (pw.length < 6) { toast('パスワードは6文字以上にしてね'); return; }
     const btn = $('#startbtn'); btn.disabled = true;
-    s.savedAt = Date.now();
+    s.savedAt = Date.now(); s.accAsk = true;
     let r = null;
-    try { r = await sbCall('wq_save', { p_name: name, p_pin: pin, p_data: cloudData(s), p_prog: prog(s), p_saved_at: s.savedAt, p_create: true }); } catch (e) {}
+    try { r = await sbCall('wq2_register', { p_email: email, p_password: pw, p_name: name, p_data: cloudData(s), p_prog: prog(s), p_saved_at: s.savedAt }); } catch (e) {}
     btn.disabled = false;
-    if (r && !r.ok && r.err === 'taken') { toast('この名前はもう使われています。ちがう名前にしてね'); return; }
-    if (r && !r.ok && (r.err === 'older' || r.err === 'locked')) { toast('この名前の記録があります。上の「名前と合言葉で続きから」から入ってね'); return; }
-    if (r && r.ok) { const p = { name, pin }; passSet(p); CLOUD = passCloud(p); CLOUD_BEST = prog(s); }
-    else toast('合言葉の登録に失敗しました。あとで宿屋から登録できます');
+    if (r && !r.ok && (r.err === 'taken' || r.err === 'email' || r.err === 'pwlen')) { toast(accMsg(r)); return; }
+    if (r && r.ok) { accUse(r.email || email, r.token, name); CLOUD_BEST = prog(s); }
+    else toast('登録できませんでした。あとで宿屋から登録できます');
   }
   S = s;
   save();
@@ -869,68 +900,137 @@ async function startGame() {
 }
 // 全角の数字を半角に（スマホで全角になっていても通るように）
 function toHalf(t) { return String(t || '').replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)); }
-// 名前と合言葉で続きから（ほかのスマホやアプリで遊んでいた記録を呼び出す）
-function passLogin() {
-  modal(`<div class="plain"><h3>名前と合言葉で続きから</h3>
-    <p class="muted" style="margin:0 0 10px">冒険をはじめたときの名前と、数字4けたの合言葉を入れてね</p>
-    <input type="text" id="lnm" maxlength="10" placeholder="名前" value="${esc(S ? S.name : '')}">
-    <input type="tel" id="lpin" inputmode="numeric" maxlength="4" placeholder="合言葉（数字4けた）" autocomplete="off" style="margin-top:8px">
+// メールアドレスとパスワードをそろえる（全角で打っても、前後に空白があっても通るように）
+function emNorm(t) { return String(t || '').normalize('NFKC').trim().toLowerCase(); }
+function emOk(e) { return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e) && e.length <= 254; }
+function pwNorm(t) { return String(t || '').normalize('NFKC').trim(); }
+// メールアドレスとパスワードの入力欄（p は id の頭。ac はパスワード欄の autocomplete。
+// 新しく決めるときは off にする：iPhone の Safari が勝手に長いパスワードを作ってしまい、ほかのアプリで入れなくなるため）
+function accFields(p, email, ac) {
+  return `<input type="email" id="${p}em" inputmode="email" autocomplete="email" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="254" placeholder="メールアドレス" value="${esc(email || '')}">
+    <input type="password" id="${p}pw" autocomplete="${ac || 'off'}" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="50" placeholder="パスワード（6文字以上）" style="margin-top:8px">
+    <label class="pwshow"><input type="checkbox" onchange="$('#${p}pw').type=this.checked?'text':'password'">パスワードを表示</label>`;
+}
+// メールアドレスとパスワードで続きから（ほかのスマホやアプリで遊んでいた記録を呼び出す）
+function accLogin(email) {
+  modalSwap(`<div class="plain"><h3>メールアドレスで続きから</h3>
+    <p class="muted" style="margin:0 0 10px">登録したメールアドレスとパスワードを入れてね</p>
+    ${accFields('l', email || '', 'current-password')}
     ${S ? '<p class="muted" style="margin:8px 0 0">このスマホの今の記録は、呼び出した記録に入れかわります</p>' : ''}
     <div class="grid2" style="margin-top:12px"><button class="btn sub" onclick="closeModal()">やめる</button>
-    <button class="btn grn" id="lgo" onclick="passLoginGo()">続きから</button></div></div>`);
+    <button class="btn grn" id="lgo" onclick="accLoginGo()">続きから</button></div>
+    <button class="btn sub sm w" style="margin-top:10px" onclick="accForgot($('#lem').value)">パスワードを忘れた方</button></div>`);
 }
-async function passLoginGo() {
-  const name = $('#lnm').value.trim(), pin = toHalf($('#lpin').value).trim();
-  if (!name) { toast('名前を入れてね'); return; }
-  if (!/^\d{4}$/.test(pin)) { toast('合言葉は数字4けたで入れてね'); return; }
+async function accLoginGo() {
+  const email = emNorm($('#lem').value), pw = pwNorm($('#lpw').value);
+  if (!emOk(email)) { toast('メールアドレスを入れてね'); return; }
+  if (!pw) { toast('パスワードを入れてね'); return; }
   const btn = $('#lgo'); btn.disabled = true;
   let r = null;
-  try { r = await sbCall('wq_load', { p_name: name, p_pin: pin }); } catch (e) {}
+  try { r = await sbCall('wq2_login', { p_email: email, p_password: pw }); } catch (e) {}
   btn.disabled = false;
-  if (!r) { toast('つながりませんでした。電波のよいところでもう一度'); return; }
-  if (!r.ok) { toast(r.err === 'none' ? 'その名前の記録が見つかりません' : r.err === 'pin' ? '合言葉がちがいます' : r.err === 'locked' ? 'まちがいが多いので、30分ほど待ってね' : '名前と合言葉を確かめてね'); return; }
-  let c = null;
-  try { const x = JSON.parse(r.data); if (x && x.v === 1) c = fill(x); } catch (e) {}
-  if (!c) { toast('記録を読みこめませんでした'); return; }
-  if (START_SND !== null) { c.sound = START_SND; c.music = START_SND; }
-  c.back = null; c.passAsk = true;
-  S = c;
-  try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
-  const p = { name: r.name || name, pin }; passSet(p); CLOUD = passCloud(p); CLOUD_BEST = prog(c);
+  if (!r || !r.ok) { toast(accMsg(r, 'メールアドレスとパスワードを確かめてね')); return; }
+  if (!accTake(r)) { toast('記録を読みこめませんでした'); return; }
+  accUse(r.email || email, r.token, S.name);
   closeModal(); TAB = 'home'; render(); sfx('join');
   toast(`おかえり、${S.name}！続きから遊べます`);
 }
-// 前から遊んでいる人（このスマホの記録はあるが、合言葉をまだ決めていない）に合言葉を決めてもらう
-function passSetup() {
+// パスワードを忘れた方：登録したメールアドレスに、新しいパスワードを決めるリンクを送る
+function accForgot(email) {
+  modalSwap(`<div class="plain"><h3>パスワードを忘れた方</h3>
+    <p class="muted" style="margin:0 0 10px">登録したメールアドレスに、新しいパスワードを決めるためのリンクを送ります</p>
+    <input type="email" id="fem" inputmode="email" autocomplete="email" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="254" placeholder="メールアドレス" value="${esc(emNorm(email))}">
+    <div class="grid2" style="margin-top:12px"><button class="btn sub" onclick="closeModal()">やめる</button>
+    <button class="btn grn" id="fgo" onclick="accForgotGo()">メールを送る</button></div></div>`);
+}
+async function accForgotGo() {
+  const email = emNorm($('#fem').value);
+  if (!emOk(email)) { toast('メールアドレスを入れてね'); return; }
+  const btn = $('#fgo'); btn.disabled = true; btn.textContent = '送っています…';
+  let r = null;
+  try { r = await sbCall('wq2_reset_request', { p_email: email }); } catch (e) {}
+  if (!r || !r.ok) {
+    btn.disabled = false; btn.textContent = 'メールを送る';
+    if (r && r.err === 'mail') accMailNg(); else toast(accMsg(r, 'メールを送れませんでした'));
+    return;
+  }
+  // 送れたかどうかをその場で確かめる（すごろくで再設定のメールが2か月届いていなかったことがあるので、送れなかったらすぐ知らせる）
+  let st = 'pending';
+  for (let i = 0; i < 12 && st === 'pending'; i++) {
+    await new Promise(ok => setTimeout(ok, 1500));
+    try { const x = await sbCall('wq2_reset_status', { p_rid: r.rid }); if (x && x.ok) st = x.status; } catch (e) {}
+  }
+  if (st === 'failed') { accMailNg(); return; }
+  modalSwap(`<div class="plain"><h3>メールを送りました</h3>
+    ${sayHTML('mage', `<em>${esc(email)}</em> にメールを送ったよ！メールのリンクを開いて、新しいパスワードを決めてね`)}
+    <p class="muted" style="margin:8px 0 0">リンクは30分だけ使えます。届かないときは、迷惑メールのフォルダも見てね</p>
+    ${st === 'pending' ? '<p class="muted" style="margin:6px 0 0">メールが届くまで、数分かかることがあります</p>' : ''}
+    <button class="btn grn w" style="margin-top:12px" onclick="closeModal()">わかった</button></div>`);
+}
+function accMailNg() {
+  modalSwap(`<div class="plain"><h3>メールを送れませんでした</h3>
+    <p style="margin:0 0 10px;font-size:14px">いまメールを送るしくみがうまく動いていません。時間をおいてもう一度ためすか、このゲームを教えてくれた人に知らせてね</p>
+    <button class="btn grn w" onclick="closeModal()">とじる</button></div>`);
+}
+// メールのリンク（#reset=…）から来たとき：新しいパスワードを決める
+let RESET_TOKEN = null;
+function accResetForm() {
+  if (!RESET_TOKEN) return;
+  modalSwap(`<div class="plain"><h3>新しいパスワードを決める</h3>
+    <p class="muted" style="margin:0 0 10px">これからは、このパスワードで続きから遊べます</p>
+    <input type="password" id="rpw" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="50" placeholder="新しいパスワード（6文字以上）">
+    <label class="pwshow"><input type="checkbox" onchange="$('#rpw').type=this.checked?'text':'password'">パスワードを表示</label>
+    <p class="muted" style="margin:8px 0 0">忘れないようにメモしておいてね</p>
+    ${S && !(CLOUD && CLOUD.kind === 'acc') ? '<p class="muted" style="margin:6px 0 0">このスマホの今の記録は、登録した記録に入れかわります</p>' : ''}
+    <div class="grid2" style="margin-top:12px"><button class="btn sub" onclick="RESET_TOKEN=null;closeModal()">やめる</button>
+    <button class="btn grn" id="rgo" onclick="accResetGo()">決める</button></div></div>`);
+}
+async function accResetGo() {
+  const pw = pwNorm($('#rpw').value);
+  if (pw.length < 6) { toast('パスワードは6文字以上にしてね'); return; }
+  const btn = $('#rgo'); btn.disabled = true;
+  let r = null;
+  try { r = await sbCall('wq2_reset_finish', { p_reset: RESET_TOKEN, p_password: pw }); } catch (e) {}
+  btn.disabled = false;
+  if (!r || (!r.ok && r.err === 'pwlen')) { toast(accMsg(r)); return; }
+  if (!r.ok) {
+    RESET_TOKEN = null;
+    modalSwap(`<div class="plain"><h3>${r.err === 'used' ? 'このリンクはもう使われています' : r.err === 'expired' ? 'リンクの期限が切れています' : 'このリンクは使えません'}</h3>
+      <p style="margin:0 0 10px;font-size:14px">もう一度「パスワードを忘れた方」から、メールを送り直してね</p>
+      <div class="grid2"><button class="btn sub" onclick="closeModal()">とじる</button>
+      <button class="btn grn" onclick="accForgot()">送り直す</button></div></div>`);
+    return;
+  }
+  RESET_TOKEN = null;
+  if (!accTake(r)) { toast('記録を読みこめませんでした'); return; }
+  accUse(r.email, r.token, S.name);
+  closeModal(); TAB = 'home'; render(); sfx('join');
+  toast(`パスワードを決めました。おかえり、${S.name}！`);
+}
+// 前から遊んでいる人（このスマホの記録はあるが、まだ登録していない）に、メールアドレスとパスワードを決めてもらう
+function accSetup() {
   if (!S) return;
-  S.passAsk = true; save();
-  modal(`<div class="plain"><h3>合言葉を決めよう</h3>
-    ${sayHTML('mage', '名前と合言葉を決めておくと、ほかのスマホやアプリで開いても続きから遊べるよ！')}
-    <input type="text" id="snm" maxlength="10" placeholder="名前" value="${esc(S.name)}">
-    <input type="tel" id="spin" inputmode="numeric" maxlength="4" placeholder="合言葉（数字4けた）" autocomplete="off" style="margin-top:8px">
+  S.accAsk = true; save();
+  modal(`<div class="plain"><h3>メールアドレスを登録しよう</h3>
+    ${sayHTML('mage', 'メールアドレスとパスワードを登録しておくと、ほかのスマホやアプリで開いても続きから遊べるよ！')}
+    ${accFields('s', '', 'off')}
     <p class="muted" style="margin:8px 0 0">忘れないようにメモしておいてね</p>
     <div class="grid2" style="margin-top:12px"><button class="btn sub" onclick="closeModal()">あとで</button>
-    <button class="btn grn" id="sgo" onclick="passSetupGo()">決める</button></div></div>`);
+    <button class="btn grn" id="sgo" onclick="accSetupGo()">登録する</button></div>
+    <button class="btn sub sm w" style="margin-top:10px" onclick="accLogin()">もう登録している人はこちら</button></div>`);
 }
-async function passSetupGo() {
-  const name = $('#snm').value.trim().slice(0, 10), pin = toHalf($('#spin').value).trim();
-  if (!name) { toast('名前を入れてね'); return; }
-  if (!/^\d{4}$/.test(pin)) { toast('合言葉は数字4けたで入れてね'); return; }
+async function accSetupGo() {
+  const email = emNorm($('#sem').value), pw = pwNorm($('#spw').value);
+  if (!emOk(email)) { toast('メールアドレスを入れてね'); return; }
+  if (pw.length < 6) { toast('パスワードは6文字以上にしてね'); return; }
   const btn = $('#sgo'); btn.disabled = true;
   S.savedAt = Date.now();
   let r = null;
-  try { r = await sbCall('wq_save', { p_name: name, p_pin: pin, p_data: cloudData(S), p_prog: prog(S), p_saved_at: S.savedAt, p_create: true }); } catch (e) {}
+  try { r = await sbCall('wq2_register', { p_email: email, p_password: pw, p_name: S.name, p_data: cloudData(S), p_prog: prog(S), p_saved_at: S.savedAt }); } catch (e) {}
   btn.disabled = false;
-  if (!r) { toast('つながりませんでした。電波のよいところでもう一度'); return; }
-  if (!r.ok && r.err === 'taken') { toast('この名前はもう使われています。ちがう名前にしてね'); return; }
-  if (!r.ok && r.err === 'locked') { toast('まちがいが多いので、30分ほど待ってね'); return; }
-  if (!r.ok && r.err !== 'older') { toast('名前と合言葉を確かめてね'); return; }
-  const p = { name, pin }; passSet(p); CLOUD = passCloud(p);
-  closeModal();
-  // 同じ名前と合言葉で、このスマホより進んだ記録があった：そちらを読みこむ
-  if (!r.ok && r.err === 'older') { CLOUD_BEST = -1; await cloudPull(); return; }
-  CLOUD_BEST = prog(S);
-  render(); toast('合言葉を決めました。ほかのスマホでも続きから遊べます');
+  if (!r || !r.ok) { toast(accMsg(r, 'メールアドレスとパスワードを確かめてね')); return; }
+  accUse(r.email || email, r.token, S.name); CLOUD_BEST = prog(S);
+  closeModal(); render(); toast('登録しました。ほかのスマホでも続きから遊べます');
 }
 // 引き継ぎコード（前の Claude のページから持ってきた記録）を貼りつけて続きから
 function codeImport() {
@@ -947,7 +1047,7 @@ async function codeImportGo(code, auto) {
   // このスマホに、もっと進んだ記録があれば上書きしない
   if (S && prog(S) > prog(c)) { if (!auto) toast('このスマホの記録のほうが進んでいるので、そのままにしました'); return false; }
   if (START_SND !== null) { c.sound = START_SND; c.music = START_SND; }
-  c.back = null; c.passAsk = false; c.saveTip = true;
+  c.back = null; c.accAsk = false; c.saveTip = true;
   S = c; save();
   if (!auto) { closeModal(); TAB = 'home'; render(); toast(`おかえり、${S.name}！続きから遊べます`); }
   return true;
@@ -959,7 +1059,7 @@ async function moveOut() {
   let url = NEW_URL, code = '';
   if (S) { try { code = await packSave(S); url = NEW_URL + '#import=' + code; } catch (e) {} }
   modal(`<div class="plain"><h3>新しい場所へ引っ越し</h3>
-    ${sayHTML('mage', '新しい場所では「名前と合言葉」で、どのスマホやアプリからでも続きから遊べるよ！')}
+    ${sayHTML('mage', '新しい場所では「メールアドレスとパスワード」で、どのスマホやアプリからでも続きから遊べるよ！')}
     <a class="btn grn w" href="${url}" target="_blank" rel="noopener" style="text-decoration:none">${S ? '記録ごと新しい場所を開く' : '新しい場所を開く'}</a>
     ${code ? `<p class="muted" style="margin:12px 0 4px">うまく開けないときは、下のコードをコピーして、新しい場所の「引き継ぎコードで続きから」に貼りつけてね</p>
     <textarea id="mcode" readonly style="min-height:70px;font-size:12px">${code}</textarea>
@@ -1434,11 +1534,12 @@ function viewRecord() {
     ${DEMO ? `<div class="card"><h3>デモ版</h3><p style="margin:0 0 8px;font-size:14px">いまはデモ版です。まだ行けない章やステージも見られます</p>
       <button class="btn sm sub" onclick="setDemo(false);toast('デモ版オフ');render()">デモ版をやめる</button></div>` : ''}
     <div class="card"><h3>記録の残しかた</h3>
-      ${PASS_HOST ? (CLOUD && CLOUD.kind === 'pass' ? `<p style="margin:0 0 6px;font-size:14px">☁️ 名前「<b>${esc(CLOUD.name)}</b>」と合言葉で記録を残しています。ほかのスマホやアプリで開いたときは、はじめの画面の「名前と合言葉で続きから」で入ってね</p>
-      <button class="btn sm sub" onclick="toast('合言葉は ${passGet() ? passGet().pin : ''} です')">合言葉を見る</button></div>`
-      : `<p style="margin:0 0 6px;font-size:14px">いまは記録がこのスマホの中だけにあります。名前と合言葉を決めると、ほかのスマホやアプリからも続きから遊べます</p>
-      <button class="btn sm grn" onclick="passSetup()">合言葉を決める</button></div>`) : `
-      <div style="background:#fff3d6;border-radius:8px;padding:8px 10px;margin:0 0 10px"><p style="margin:0 0 6px;font-size:14px">🏠 ゲームは新しい場所に引っ越しました。新しい場所では、名前と合言葉でどのスマホからでも続きから遊べます</p>
+      ${PASS_HOST ? (CLOUD && CLOUD.kind === 'acc' ? `<p style="margin:0 0 6px;font-size:14px;word-break:break-all">☁️ メールアドレス「<b>${esc(CLOUD.email)}</b>」で記録を残しています。ほかのスマホやアプリで開いたときは、はじめの画面の「メールアドレスで続きから」で入ってね</p>
+      <p class="muted" style="margin:0;font-size:13px">パスワードを忘れたときは、「メールアドレスで続きから」の中の「パスワードを忘れた方」から作り直せます</p></div>`
+      : `<p style="margin:0 0 6px;font-size:14px">いまは記録がこのスマホの中だけにあります。メールアドレスとパスワードを登録すると、ほかのスマホやアプリからも続きから遊べます</p>
+      <button class="btn sm grn" onclick="accSetup()">メールアドレスを登録する</button>
+      <button class="btn sm sub" onclick="accLogin()">登録ずみの人はこちら</button></div>`) : `
+      <div style="background:#fff3d6;border-radius:8px;padding:8px 10px;margin:0 0 10px"><p style="margin:0 0 6px;font-size:14px">🏠 ゲームは新しい場所に引っ越しました。新しい場所では、メールアドレスとパスワードでどのスマホからでも続きから遊べます</p>
       <button class="btn sm grn" onclick="moveOut()">記録ごと新しい場所へ</button></div>
       ${CLOUD ? `<p style="margin:0 0 6px;font-size:14px">☁️ 記録は <b>Claudeのアカウント</b>にも残しています。Claudeにサインインしていれば、スマホのClaudeアプリでもパソコンでも続きから遊べます</p>
       <p class="muted" style="margin:0;font-size:13px">サインインしないで開いたときは、記録はそのスマホの中だけに残ります</p></div>` : `
@@ -1480,7 +1581,7 @@ function verTap() {
   render();
 }
 function resetAll() {
-  modal(`<h3>はじめからやり直しますか？</h3><p>レベル・記録・仲間がすべて消えます。元にはもどせません</p>
+  modal(`<h3>はじめからやり直しますか？</h3><p>レベル・記録・仲間がすべて消えます。元にはもどせません${CLOUD && CLOUD.kind === 'acc' ? '<br>登録したメールアドレスの記録も消えます（同じメールアドレスで、また登録できます）' : ''}</p>
     <div class="grid2"><button class="btn sub" onclick="closeModal()">やめる</button>
     <button class="btn red" onclick="try{localStorage.removeItem(KEY)}catch(e){};cloudForget();S=null;TAB='home';closeModal();render()">消す</button></div>`);
 }
@@ -1667,8 +1768,8 @@ const HOWTO = [
   { title: '町でできること', town: [['guild', 'ギルド', '毎日のおさらい'], ['post', '郵便', '仲間の手紙'], ['inn', '宿屋', '仲間と記録'], ['shop', '道具屋', 'ビジネスガイド']],
     say: 'まちがえた問題は、<em>ギルド</em>でおさらいできるよ。' },
   // 記録の残しかた（2026-11-10 本人の指示。前から遊んでいる人には saveTip で1回だけお知らせする）
-  PASS_HOST ? { save: true, title: '名前と合言葉で続きから', f: { t: 'big', icon: '🔑', text: '名前＋合言葉（数字4けた）', sub: 'どのスマホ・アプリからでも続きから' },
-    say: 'ほかのスマホや<em>ほかのアプリ</em>で開いたら、はじめの画面の<em>名前と合言葉で続きから</em>で入ってね！' }
+  PASS_HOST ? { save: true, title: 'メールアドレスで続きから', f: { t: 'big', icon: '🔑', text: 'メールアドレス＋パスワード', sub: 'どのスマホ・アプリからでも続きから' },
+    say: 'ほかのスマホや<em>ほかのアプリ</em>で開いたら、はじめの画面の<em>メールアドレスで続きから</em>で入ってね！' }
   : { save: true, title: '記録はこのスマホに残るよ', f: { t: 'big', icon: '📱', text: 'つぎも同じ開き方で', sub: OPENED_IN ? `いまは ${OPENED_IN} で開いています` : 'LINEで開いたなら つぎもLINEから' },
     say: 'とちゅうでとじても大丈夫。<em>ほかのアプリ</em>や<em>シークレットモード</em>で開くと、最初からになるから気をつけてね！' },
   { title: '迷ったらここをタップ', f: { t: 'big', icon: '👆', text: '左上の「つぎにやること」', sub: 'いまやることに すぐ進める' },
@@ -2403,7 +2504,7 @@ function showStart() {
         ${TAIKAI ? `<p style="text-align:center;margin:0 0 10px"><span class="demo taikai" style="font-size:14px;padding:2px 10px">大会モード</span></p>` : ''}
         ${!PASS_HOST ? `<div style="background:#fff3d6;border:3px solid var(--gold2);border-radius:10px;padding:10px;margin:0 0 12px;text-align:center">
           <b style="font-weight:normal;font-size:16px">🏠 新しい場所に引っ越しました</b>
-          <p style="margin:4px 0 8px;font-size:13px;line-height:1.5">新しい場所では、名前と合言葉で<br>どのスマホからでも続きから遊べます</p>
+          <p style="margin:4px 0 8px;font-size:13px;line-height:1.5">新しい場所では、メールアドレスとパスワードで<br>どのスマホからでも続きから遊べます</p>
           <button class="btn grn w" onclick="moveOut()">${S ? '記録ごと新しい場所へ' : '新しい場所を開く'}</button></div>` : ''}
         ${sayHTML('mage', 'BGMも楽しみながらやってみてね！')}
         <button class="btn w grn" onclick="startTap(true)">🔊 音を出してはじめる</button>
@@ -2418,8 +2519,10 @@ function startTap(on) {
   if (S) { S.sound = on; S.music = on; save(); }
   if (on) ensureAC(); else stopBgm();
   render(); sfx('tap');
-  // 新しい場所（合言葉が使える）：合言葉をまだ決めていない人に1回だけ聞く
-  if (PASS_HOST) { if (S && !TAIKAI && !(CLOUD && CLOUD.kind === 'pass') && !passGet() && !S.passAsk) passSetup(); return; }
+  // メールのリンクから来た人：新しいパスワードを決める
+  if (RESET_TOKEN) { accResetForm(); return; }
+  // 新しい場所（メールアドレスで記録を残せる）：まだ登録していない人に1回だけ聞く
+  if (PASS_HOST) { if (S && !TAIKAI && !(CLOUD && CLOUD.kind === 'acc') && !accGet() && !S.accAsk) accSetup(); return; }
   // 前から遊んでいる人には、記録の残しかたを1回だけお知らせする
   if (S && S.howto && !S.saveTip) saveTip();
 }
@@ -2432,11 +2535,14 @@ if (BACK && TAB === BACK.tab && BACK.y) setTimeout(() => window.scrollTo(0, BACK
 if (DEMO_MSG) setTimeout(() => toast(DEMO_MSG), 300);
 if (TAIKAI_MSG) setTimeout(() => toast(TAIKAI_MSG), 300);
 // 前の場所（アーティファクト）から「記録ごと新しい場所へ」で来たときは、URL の #import= の記録を読みこむ
-// それから外の記録（合言葉・Claude のアカウント）とつなぐ
+// パスワードを作り直すメールのリンク（#reset=…）から来たときは、新しいパスワードを決める画面を出す（はじめる画面を押したあと）
+// それから外の記録（メールアドレス・Claude のアカウント）とつなぐ
 (async () => {
   const m = PASS_HOST && location.hash.match(/[#&]import=([\w-]+)/);
+  const rs = PASS_HOST && location.hash.match(/[#&]reset=([0-9a-f]+)/);
+  if (m || rs) { try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {} }
+  if (rs) { RESET_TOKEN = rs[1]; if (!$('#start')) accResetForm(); }
   if (m) {
-    try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
     if (await codeImportGo(m[1], true)) { render(); setTimeout(() => toast(`おかえり、${S.name}！記録を引っ越しました`), 300); }
   }
   cloudInit();
